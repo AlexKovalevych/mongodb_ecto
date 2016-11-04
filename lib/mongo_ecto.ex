@@ -503,13 +503,13 @@ defmodule Mongo.Ecto do
   end
 
   @doc false
-  def insert(_repo, meta, _params, [_|_] = returning, _opts) do
+  def insert(_repo, meta, _params, _on_conflict, [_|_] = returning, _opts) do
     raise ArgumentError,
       "MongoDB adapter does not support :read_after_writes in models. " <>
       "The following fields in #{inspect meta.schema} are tagged as such: #{inspect returning}"
   end
 
-  def insert(repo, meta, params, [], opts) do
+  def insert(repo, meta, params, _on_conflict, [], opts) do
     normalized = NormalizedQuery.insert(meta, params)
 
     case Connection.insert(repo, normalized, opts) do
@@ -517,6 +517,28 @@ defmodule Mongo.Ecto do
         {:ok, []}
       other ->
         other
+    end
+  end
+
+  @doc false
+  def insert_all(repo, meta, header, rows, {_, conflict_params, _} = on_conflict, returning, opts) do
+    normalized = NormalizedQuery.insert_all(meta, rows)
+    case Connection.insert_all(repo, normalized, opts) do
+      {:ok, _} ->
+        {:ok, nil}
+      other ->
+        other
+    end
+  end
+
+  def unzip_inserts(header, rows) do
+    Enum.map_reduce rows, [], fn fields, params ->
+      Enum.map_reduce header, params, fn key, acc ->
+        case :lists.keyfind(key, 1, fields) do
+          {^key, value} -> {key, [value|acc]}
+          false -> {nil, acc}
+        end
+      end
     end
   end
 

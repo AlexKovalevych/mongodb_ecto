@@ -111,6 +111,17 @@ defmodule Mongo.Ecto.Connection do
     end
   end
 
+  def insert_all(repo, %WriteQuery{} = query, opts) do
+    coll     = query.coll
+    command  = query.command
+    opts     = query.opts ++ opts
+
+    case query(repo, :insert_many, [coll, command], opts) do
+      {:ok, result}   -> {:ok, result}
+      {:error, error} -> check_constraint_errors(error)
+    end
+  end
+
   def command(repo, %CommandQuery{} = query, opts) do
     command  = query.command
     opts     = query.opts ++ opts

@@ -128,6 +128,13 @@ defmodule Mongo.Ecto.NormalizedQuery do
     %WriteQuery{coll: coll, command: command, database: prefix}
   end
 
+  def insert_all(%{source: {prefix, coll}, schema: schema}, documents) do
+    documents = Enum.map(documents, fn document -> {document, primary_key(schema)} end)
+    command = command(:insert_many, documents, nil)
+
+    %WriteQuery{coll: coll, command: command, database: prefix}
+  end
+
   def command(command, opts) do
     %CommandQuery{command: command, database: Keyword.get(opts, :database, nil)}
   end
@@ -260,6 +267,10 @@ defmodule Mongo.Ecto.NormalizedQuery do
     document
     |> value(pk, "insert command")
     |> map_unless_empty
+  end
+
+  defp command(:insert_many, documents, nil) do
+    Enum.map(documents, fn {document, pk} -> command(:insert, document, pk) end)
   end
 
   defp command(:update, values, pk) do
