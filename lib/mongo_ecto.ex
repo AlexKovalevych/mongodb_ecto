@@ -362,7 +362,6 @@ defmodule Mongo.Ecto do
   alias Mongo.Ecto.NormalizedQuery.WriteQuery
   alias Mongo.Ecto.NormalizedQuery.CountQuery
   alias Mongo.Ecto.NormalizedQuery.AggregateQuery
-  alias Mongo.Ecto.ObjectID
   alias Mongo.Ecto.Connection
   alias Mongo.Ecto.Conversions
 
@@ -370,106 +369,117 @@ defmodule Mongo.Ecto do
 
   @doc false
   defmacro __before_compile__(env) do
-    module = env.module
-    config = Module.get_attribute(module, :config)
-    adapter = Keyword.get(config, :pool, Mongo.Pool.Poolboy)
-
+    config = Module.get_attribute(env.module, :config)
+    pool   = Keyword.get(config, :pool, DBConnection.Poolboy)
+    pool_name = pool_name(env.module, config)
+    norm_config = normalize_config(config)
     quote do
-      defmodule Pool do
-        use Mongo.Pool, name: __MODULE__, adapter: unquote(adapter)
+      @doc false
+      def __pool__, do: {unquote(pool_name), unquote(Macro.escape(norm_config))}
 
-        def log(return, queue_time, query_time, fun, args) do
-          Mongo.Ecto.log(unquote(module), return, queue_time, query_time, fun, args)
-        end
+      defoverridable [__pool__: 0]
+    end
+  end
+
+  @pool_timeout 5_000
+  @timeout 15_000
+
+  defp normalize_config(config) do
+    config
+    |> Keyword.delete(:name)
+    |> Keyword.put_new(:timeout, @timeout)
+    |> Keyword.put_new(:pool_timeout, @pool_timeout)
+  end
+
+  defp pool_name(module, config) do
+    Keyword.get(config, :pool_name, default_pool_name(module, config))
+  end
+
+  defp default_pool_name(repo, config) do
+    Module.concat(Keyword.get(config, :name, repo), Pool)
+  end
+
+  @doc false
+  def application, do: :mongodb_ecto
+
+  @doc false
+  def child_spec(repo, opts) do
+    # Check if the pool options should be overridden
+    {pool_name, pool_opts} =
+      case Keyword.fetch(opts, :pool) do
+        {:ok, pool} ->
+          {pool_name(repo, opts), opts}
+        _ ->
+          repo.__pool__
       end
+    opts = [name: pool_name] ++ Keyword.delete(opts, :pool) ++ pool_opts
 
-      def __mongo_pool__, do: unquote(module).Pool
-    end
+    Mongo.child_spec(opts)
   end
 
   @doc false
-  def start_link(repo, opts) do
-    {:ok, _} = Application.ensure_all_started(:mongodb_ecto)
+  # TODO: handle date and time
+  def loaders(:datetime,  type), do: [&load_datetime/1, type]
+  def loaders(:binary_id, type), do: [&load_objectid/1, type]
+  def loaders(:uuid,      type), do: [&load_binary/1,   type]
+  def loaders(:binary,    type), do: [&load_binary/1,   type]
+  def loaders(_base,      type), do: [type]
 
-    repo.__mongo_pool__.start_link(opts)
-  end
-
-  @doc false
-  def stop(pid, timeout) do
-    ref = Process.monitor(pid)
-    Process.exit(pid, :normal)
-    receive do
-      {:DOWN, ^ref, _, _, _} -> :ok
-    after
-      timeout -> exit(:timeout)
-    end
-    Application.stop(:mongodb_ecto)
-    :ok
-  end
-
-  @doc false
-  def load(_type, nil),
-    do: {:ok, nil}
-  # wat
-  def load(:binary_id, %BSON.ObjectId{value: value}),
-    do: ObjectID.load(value)
-  def load(:binary, %BSON.Binary{binary: value}),
-    do: {:ok, value}
-  def load(Ecto.UUID, %BSON.Binary{binary: value}),
-    do: {:ok, value}
-  def load(:map, keyword),
-    do: {:ok, Enum.into(keyword, %{})}
-  def load(Ecto.Date, %BSON.DateTime{} = datetime) do
-    {date, _time} = BSON.DateTime.to_datetime(datetime)
-    Ecto.Date.load(date)
-  end
-  def load(Ecto.Time, %BSON.DateTime{} = datetime) do
-    {_date, time} = BSON.DateTime.to_datetime(datetime)
-    Ecto.Time.load(time)
-  end
-  def load(Ecto.DateTime, %BSON.DateTime{} = datetime),
-    do: datetime |> BSON.DateTime.to_datetime |> Ecto.DateTime.load
-  def load(type, data),
-    do: Ecto.Type.load(type, data, &load/2)
-
-  @doc false
-  def dump(_type, nil),
-    do: {:ok, nil}
-  def dump(:binary_id, data),
-    do: ObjectID.dump(data)
-  def dump(:binary, value),
-    do: {:ok, %BSON.Binary{binary: value}}
-  def dump(Ecto.UUID, value),
-    do: {:ok, %BSON.Binary{binary: value, subtype: :uuid}}
-  def dump(Ecto.Date, datetime),
-    do: from_datetime(datetime)
-  def dump(Ecto.Time, datetime),
-    do: from_datetime(datetime)
-  def dump(Ecto.DateTime, datetime),
-    do: from_datetime(datetime)
-  def dump(type, data),
-    do: Ecto.Type.dump(type, data, &dump/2)
-
-  @epoch :calendar.datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}})
-
-  defp from_datetime(%Ecto.Date{year: year, month: month, day: day}),
-    do: from_datetime({{year, month, day}, {0, 0, 0, 0}})
-  defp from_datetime(%Ecto.Time{hour: hour, min: min, sec: sec, usec: usec}),
-    do: from_datetime({{1970, 1, 1}, {hour, min, sec, usec}})
-  defp from_datetime(%Ecto.DateTime{year: year, month: month, day: day, hour: hour, min: min, sec: sec, usec: usec}),
-    do: from_datetime({{year, month, day}, {hour, min, sec, usec}})
-  defp from_datetime({_, _, _, _} = time),
-    do: from_datetime({{1970, 1, 1}, time})
-  defp from_datetime({date, {hour, min, sec, usec}}) do
-    greg_secs = :calendar.datetime_to_gregorian_seconds({date, {hour, min, sec}})
-    epoch_secs = greg_secs - @epoch
-    {:ok, %BSON.DateTime{utc: epoch_secs * 1000 + div(usec, 1000)}}
-  end
-  defp from_datetime(_),
+  defp load_datetime(%BSON.DateTime{} = datetime),
+    do: {:ok, BSON.DateTime.to_datetime(datetime)}
+  defp load_datetime(_),
     do: :error
 
+  defp load_binary(%BSON.Binary{binary: binary}),
+    do: {:ok, binary}
+  defp load_binary(_),
+    do: :error
+
+  defp load_objectid(%BSON.ObjectId{} = objectid) do
+    try do
+      {:ok, BSON.ObjectId.encode!(objectid)}
+    catch
+      ArgumentError ->
+        :error
+    end
+  end
+  defp load_objectid(_), do: :error
+
   @doc false
-  def embed_id(_), do: ObjectID.generate
+  # TODO: handle date and time
+  def dumpers(:datetime,  type), do: [type, &dump_datetime/1]
+  def dumpers(:binary_id, type), do: [type, &dump_objectid/1]
+  def dumpers(:uuid,      type), do: [type, &dump_binary(&1, :uuid)]
+  def dumpers(:binary,    type), do: [type, &dump_binary(&1, :generic)]
+  def dumpers(_base,      type), do: [type]
+
+  defp dump_datetime({{_, _, _}, {_, _, _, _}} = datetime),
+    do: {:ok, BSON.DateTime.from_datetime(datetime)}
+  defp dump_datetime(_),
+    do: :error
+
+  defp dump_binary(binary, subtype) when is_binary(binary),
+    do: {:ok, %BSON.Binary{binary: binary, subtype: subtype}}
+  defp dump_binary(_, _),
+    do: :error
+
+  defp dump_objectid(<<objectid :: binary-size(24)>>) do
+    try do
+      {:ok, BSON.ObjectId.decode!(objectid)}
+    catch
+      ArgumentError ->
+        :error
+    end
+  end
+  defp dump_objectid(_), do: :error
+
+  @doc false
+  def autogenerate(:id),
+    do: raise "MongoDB adapter does not support `:id` type as primary key"
+  def autogenerate(:embed_id),
+    do: BSON.ObjectId.encode!(Mongo.object_id)
+  def autogenerate(:binary_id),
+    do: Mongo.object_id
 
   @doc false
   def prepare(function, query) do
@@ -479,58 +489,30 @@ defmodule Mongo.Ecto do
   @read_queries [ReadQuery, CountQuery, AggregateQuery]
 
   @doc false
-  def execute(repo, _meta, {function, query}, params, preprocess, opts) do
+  def execute(repo, _meta, {:nocache, {function, query}}, params, process, opts) do
     case apply(NormalizedQuery, function, [query, params]) do
       %{__struct__: read} = query when read in @read_queries ->
         {rows, count} =
-          Connection.read(repo.__mongo_pool__, query, opts)
-          |> Enum.map_reduce(0, &{process_document(&1, query, preprocess), &2 + 1})
+          Connection.read(repo, query, opts)
+          |> Enum.map_reduce(0, &{process_document(&1, query, process), &2 + 1})
         {count, rows}
       %WriteQuery{} = write ->
-        result = apply(Connection, function, [repo.__mongo_pool__, write, opts])
+        result = apply(Connection, function, [repo, write, opts])
         {result, nil}
     end
   end
 
   @doc false
-  def insert(_repo, meta, _params, {key, :id, _}, _returning, _opts) do
-    raise ArgumentError,
-      "MongoDB adapter does not support :id field type in models. " <>
-      "The #{inspect key} field in #{inspect meta.model} is tagged as such."
-  end
-
-  def insert(_repo, meta, _params, _autogen, [_] = returning, _opts) do
+  def insert(_repo, meta, _params, [_|_] = returning, _opts) do
     raise ArgumentError,
       "MongoDB adapter does not support :read_after_writes in models. " <>
-      "The following fields in #{inspect meta.model} are tagged as such: #{inspect returning}"
+      "The following fields in #{inspect meta.schema} are tagged as such: #{inspect returning}"
   end
 
-  def insert(repo, meta, params, nil, [], opts) do
-    normalized = NormalizedQuery.insert(meta, params, nil)
+  def insert(repo, meta, params, [], opts) do
+    normalized = NormalizedQuery.insert(meta, params)
 
-    case Connection.insert(repo.__mongo_pool__, normalized, opts) do
-      {:ok, _} ->
-        {:ok, []}
-      other ->
-        other
-    end
-  end
-
-  def insert(repo, meta, params, {pk, :binary_id, nil}, [], opts) do
-    normalized = NormalizedQuery.insert(meta, params, pk)
-
-    case Connection.insert(repo.__mongo_pool__, normalized, opts) do
-      {:ok, %{inserted_id: objid}} ->
-        {:ok, [{pk, objid}]}
-      other ->
-        other
-    end
-  end
-
-  def insert(repo, meta, params, {pk, :binary_id, _value}, [], opts) do
-    normalized = NormalizedQuery.insert(meta, params, pk)
-
-    case Connection.insert(repo.__mongo_pool__, normalized, opts) do
+    case Connection.insert(repo, normalized, opts) do
       {:ok, _} ->
         {:ok, []}
       other ->
@@ -554,13 +536,13 @@ defmodule Mongo.Ecto do
   def update(repo, meta, fields, filter, {pk, :binary_id, _value}, [], opts) do
     normalized = NormalizedQuery.update(meta, fields, filter, pk)
 
-    Connection.update(repo.__mongo_pool__, normalized, opts)
+    Connection.update(repo, normalized, opts)
   end
 
   def update(repo, meta, fields, filter, nil, [], opts) do
     normalized = NormalizedQuery.update(meta, fields, filter, nil)
 
-    Connection.update(repo.__mongo_pool__, normalized, opts)
+    Connection.update(repo, normalized, opts)
   end
 
   @doc false
@@ -573,13 +555,13 @@ defmodule Mongo.Ecto do
   def delete(repo, meta, filter, {pk, :binary_id, _value}, opts) do
     normalized = NormalizedQuery.delete(meta, filter, pk)
 
-    Connection.delete(repo.__mongo_pool__, normalized, opts)
+    Connection.delete(repo, normalized, opts)
   end
 
   def delete(repo, meta, fields, filter, nil, [], opts) do
     normalized = NormalizedQuery.update(meta, fields, filter, nil)
 
-    Connection.update(repo.__mongo_pool__, normalized, opts)
+    Connection.update(repo, normalized, opts)
   end
 
   defp process_document(document, %{fields: fields, pk: pk}, preprocess) do
@@ -653,7 +635,7 @@ defmodule Mongo.Ecto do
 
     query = %WriteQuery{coll: "system.indexes", command: index}
 
-    {:ok, _} = Connection.insert(repo.__mongo_pool__, query, opts)
+    {:ok, _} = Connection.insert(repo, query, opts)
     :ok
   end
 
@@ -678,7 +660,7 @@ defmodule Mongo.Ecto do
                         command: ["$rename": [{to_string(old), to_string(new)}]],
                         opts: [multi: true]}
 
-    {:ok, _} = Connection.update(repo.__mongo_pool__, query, opts)
+    {:ok, _} = Connection.update(repo, query, opts)
     :ok
   end
 
@@ -751,7 +733,7 @@ defmodule Mongo.Ecto do
   def command(repo, command, opts \\ []) do
     normalized = NormalizedQuery.command(command, opts)
 
-    Connection.command(repo.__mongo_pool__, normalized, opts)
+    Connection.command(repo, normalized, opts)
   end
 
   special_regex = %BSON.Regex{pattern: "\\.system|\\$", options: ""}
@@ -781,7 +763,7 @@ defmodule Mongo.Ecto do
     query = %ReadQuery{coll: "system.namespaces", query: @list_collections_query}
     opts = Keyword.put(opts, :log, false)
 
-    Connection.read(repo.__mongo_pool__, query, opts)
+    Connection.read(repo, query, opts)
     |> Enum.map(&Map.fetch!(&1, "name"))
     |> Enum.map(fn collection ->
       collection |> String.split(".", parts: 2) |> Enum.at(1)
@@ -790,7 +772,7 @@ defmodule Mongo.Ecto do
 
   defp truncate_collection(repo, collection, opts) do
     query = %WriteQuery{coll: collection, query: %{}}
-    Connection.delete_all(repo.__mongo_pool__, query, opts)
+    Connection.delete_all(repo, query, opts)
   end
 
   defp namespace(repo, coll) do
@@ -801,60 +783,5 @@ defmodule Mongo.Ecto do
     version = command(repo, %{"buildinfo": 1}, [])["versionArray"]
 
     Enum.fetch!(version, 0)
-  end
-
-  @doc false
-  def log(repo, :ok, queue_time, query_time, fun, args) do
-    log(repo, {:ok, nil}, queue_time, query_time, fun, args)
-  end
-  def log(repo, return, queue_time, query_time, fun, args) do
-    entry =
-      %Ecto.LogEntry{query: &format_log(&1, fun, args), params: [],
-                     result: return, query_time: query_time, queue_time: queue_time}
-    repo.log(entry)
-  end
-
-  defp format_log(_entry, :run_command, [command, _opts]) do
-    ["COMMAND " | inspect(command)]
-  end
-  defp format_log(_entry, :insert_one, [coll, doc, _opts]) do
-    ["INSERT", format_part("coll", coll), format_part("document", doc)]
-  end
-  defp format_log(_entry, :insert_many, [coll, docs, _opts]) do
-    ["INSERT", format_part("coll", coll), format_part("documents", docs)]
-  end
-  defp format_log(_entry, :delete_one, [coll, filter, _opts]) do
-    ["DELETE", format_part("coll", coll), format_part("filter", filter),
-     format_part("many", false)]
-  end
-  defp format_log(_entry, :delete_many, [coll, filter, _opts]) do
-    ["DELETE", format_part("coll", coll), format_part("filter", filter),
-     format_part("many", true)]
-  end
-  defp format_log(_entry, :replace_one, [coll, filter, doc, _opts]) do
-    ["REPLACE", format_part("coll", coll), format_part("filter", filter),
-     format_part("document", doc)]
-  end
-  defp format_log(_entry, :update_one, [coll, filter, update, _opts]) do
-    ["UPDATE", format_part("coll", coll), format_part("filter", filter),
-     format_part("update", update), format_part("many", false)]
-  end
-  defp format_log(_entry, :update_many, [coll, filter, update, _opts]) do
-    ["UPDATE", format_part("coll", coll), format_part("filter", filter),
-     format_part("update", update), format_part("many", true)]
-  end
-  defp format_log(_entry, :find, [coll, query, projection, _opts]) do
-    ["FIND", format_part("coll", coll), format_part("query", query),
-     format_part("projection", projection)]
-  end
-  defp format_log(_entry, :find_rest, [coll, cursor, _opts]) do
-    ["GET_MORE", format_part("coll", coll), format_part("cursor_id", cursor)]
-  end
-  defp format_log(_entry, :kill_cursors, [cursors, _opts]) do
-    ["KILL_CURSORS", format_part("cursor_ids", cursors)]
-  end
-
-  defp format_part(name, value) do
-    [" ", name, "=" | inspect(value)]
   end
 end
